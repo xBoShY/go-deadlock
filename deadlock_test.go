@@ -3,6 +3,7 @@ package deadlock
 import (
 	"log"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -185,5 +186,44 @@ func TestLockDuplicate(t *testing.T) {
 	time.Sleep(time.Second * 1)
 	if atomic.LoadUint32(&deadlocks) != 2 {
 		t.Fatalf("expected 2 deadlocks, detected %d", deadlocks)
+	}
+}
+
+const largeObjectSize = 10 * 1024 * 1024
+
+type largeStruct struct {
+	dummy [largeObjectSize]byte
+	mu    Mutex
+}
+
+func TestMemoryUsage(t *testing.T) {
+	var start runtime.MemStats
+	runtime.ReadMemStats(&start)
+
+	ch := make(chan struct{}, 1)
+	go func() {
+
+		x := 0
+		for i := 0; i < 10; i++ {
+			tmp1 := largeStruct{}
+			tmp2 := largeStruct{}
+			tmp1.mu.Lock()
+			tmp2.mu.Lock()
+			x++
+			tmp2.mu.Unlock()
+			tmp1.mu.Unlock()
+		}
+		_ = x
+		close(ch)
+	}()
+
+	<-ch
+
+	runtime.GC()
+
+	var end runtime.MemStats
+	runtime.ReadMemStats(&end)
+	if start.Alloc+largeObjectSize/2 < end.Alloc {
+		t.Fatalf("allocated extra %d bytes", end.Alloc-start.Alloc)
 	}
 }

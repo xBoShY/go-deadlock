@@ -44,10 +44,24 @@ var Opts = struct {
 	LogBuf:     os.Stderr,
 }
 
+type lockID uint64
+
+var counterMu sync.Mutex
+var currID = lockID(1)
+
+type identifiable interface {
+	id() lockID
+}
+
 // A Mutex is a drop-in replacement for sync.Mutex.
 // Performs deadlock detection unless disabled in Opts.
 type Mutex struct {
-	mu sync.Mutex
+	muId lockID
+	mu   sync.Mutex
+}
+
+func (m *Mutex) id() lockID {
+	return m.muId
 }
 
 // Lock locks the mutex.
@@ -57,6 +71,12 @@ type Mutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *Mutex) Lock() {
+	counterMu.Lock()
+	if m.muId == 0 {
+		m.muId = currID
+		currID++
+	}
+	counterMu.Unlock()
 	lock(m.mu.Lock, m)
 }
 
@@ -76,7 +96,12 @@ func (m *Mutex) Unlock() {
 // An RWMutex is a drop-in replacement for sync.RWMutex.
 // Performs deadlock detection unless disabled in Opts.
 type RWMutex struct {
-	mu sync.RWMutex
+	muId lockID
+	mu   sync.RWMutex
+}
+
+func (m *RWMutex) id() lockID {
+	return m.muId
 }
 
 // Lock locks rw for writing.
@@ -89,6 +114,13 @@ type RWMutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) Lock() {
+	counterMu.Lock()
+	if m.muId == 0 {
+		m.muId = currID
+		currID++
+	}
+	counterMu.Unlock()
+
 	lock(m.mu.Lock, m)
 }
 
@@ -110,6 +142,13 @@ func (m *RWMutex) Unlock() {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) RLock() {
+	counterMu.Lock()
+	if m.muId == 0 {
+		m.muId = currID
+		currID++
+	}
+	counterMu.Unlock()
+
 	lock(m.mu.RLock, m)
 }
 
@@ -130,19 +169,19 @@ func (m *RWMutex) RLocker() sync.Locker {
 	return (*rlocker)(m)
 }
 
-func preLock(skip int, p interface{}) {
+func preLock(skip int, p identifiable) {
 	lo.preLock(skip, p)
 }
 
-func postLock(skip int, p interface{}) {
+func postLock(skip int, p identifiable) {
 	lo.postLock(skip, p)
 }
 
-func postUnlock(p interface{}) {
+func postUnlock(p identifiable) {
 	lo.postUnlock(p)
 }
 
-func lock(lockFn func(), ptr interface{}) {
+func lock(lockFn func(), ptr identifiable) {
 	if Opts.Disable {
 		lockFn()
 		return
@@ -162,7 +201,8 @@ func lock(lockFn func(), ptr interface{}) {
 			select {
 			case <-t.C:
 				lo.mu.Lock()
-				prev, ok := lo.cur[ptr]
+
+				prev, ok := lo.cur[ptr.id()]
 				if !ok {
 					lo.mu.Unlock()
 					break // Nobody seems to be holding the lock, try again.
@@ -210,8 +250,8 @@ func lock(lockFn func(), ptr interface{}) {
 
 type lockOrder struct {
 	mu    sync.Mutex
-	cur   map[interface{}]stackGID // stacktraces + gids for the locks currently taken.
-	order map[beforeAfter]ss       // expected order of locks.
+	cur   map[lockID]stackGID // stacktraces + gids for the locks currently taken.
+	order map[beforeAfter]ss  // expected order of locks.
 }
 
 type stackGID struct {
@@ -220,8 +260,8 @@ type stackGID struct {
 }
 
 type beforeAfter struct {
-	before interface{}
-	after  interface{}
+	before lockID
+	after  lockID
 }
 
 type ss struct {
@@ -233,20 +273,20 @@ var lo = newLockOrder()
 
 func newLockOrder() *lockOrder {
 	return &lockOrder{
-		cur:   map[interface{}]stackGID{},
+		cur:   map[lockID]stackGID{},
 		order: map[beforeAfter]ss{},
 	}
 }
 
-func (l *lockOrder) postLock(skip int, p interface{}) {
+func (l *lockOrder) postLock(skip int, p identifiable) {
 	stack := callers(skip)
 	gid := goid.Get()
 	l.mu.Lock()
-	l.cur[p] = stackGID{stack, gid}
+	l.cur[p.id()] = stackGID{stack, gid}
 	l.mu.Unlock()
 }
 
-func (l *lockOrder) preLock(skip int, p interface{}) {
+func (l *lockOrder) preLock(skip int, p identifiable) {
 	if Opts.DisableLockOrderDetection {
 		return
 	}
@@ -254,11 +294,11 @@ func (l *lockOrder) preLock(skip int, p interface{}) {
 	gid := goid.Get()
 	l.mu.Lock()
 	for b, bs := range l.cur {
-		if b == p {
+		if b == p.id() {
 			if bs.gid == gid {
 				Opts.mu.Lock()
 				fmt.Fprintln(Opts.LogBuf, header, "Recursive locking:")
-				fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %p\n", gid, b)
+				fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %x\n", gid, b)
 				printStack(Opts.LogBuf, stack)
 				fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed (same goroutine)")
 				printStack(Opts.LogBuf, bs.stack)
@@ -274,7 +314,7 @@ func (l *lockOrder) preLock(skip int, p interface{}) {
 		if bs.gid != gid { // We want locks taken in the same goroutine only.
 			continue
 		}
-		if s, ok := l.order[beforeAfter{p, b}]; ok {
+		if s, ok := l.order[beforeAfter{p.id(), b}]; ok {
 			Opts.mu.Lock()
 			fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
 			fmt.Fprintln(Opts.LogBuf, "happened before")
@@ -293,7 +333,7 @@ func (l *lockOrder) preLock(skip int, p interface{}) {
 			Opts.mu.Unlock()
 			Opts.OnPotentialDeadlock()
 		}
-		l.order[beforeAfter{b, p}] = ss{bs.stack, stack}
+		l.order[beforeAfter{b, p.id()}] = ss{bs.stack, stack}
 		if len(l.order) == Opts.MaxMapSize { // Reset the map to keep memory footprint bounded.
 			l.order = map[beforeAfter]ss{}
 		}
@@ -301,9 +341,9 @@ func (l *lockOrder) preLock(skip int, p interface{}) {
 	l.mu.Unlock()
 }
 
-func (l *lockOrder) postUnlock(p interface{}) {
+func (l *lockOrder) postUnlock(p identifiable) {
 	l.mu.Lock()
-	delete(l.cur, p)
+	delete(l.cur, p.id())
 	l.mu.Unlock()
 }
 
@@ -313,10 +353,10 @@ func (r *rlocker) Lock()   { (*RWMutex)(r).RLock() }
 func (r *rlocker) Unlock() { (*RWMutex)(r).RUnlock() }
 
 // Under lo.mu Locked.
-func (l *lockOrder) other(ptr interface{}) {
+func (l *lockOrder) other(ptr identifiable) {
 	empty := true
 	for k := range l.cur {
-		if k == ptr {
+		if k == ptr.id() {
 			continue
 		}
 		empty = false
@@ -326,10 +366,10 @@ func (l *lockOrder) other(ptr interface{}) {
 	}
 	fmt.Fprintln(Opts.LogBuf, "Other goroutines holding locks:")
 	for k, pp := range l.cur {
-		if k == ptr {
+		if k == ptr.id() {
 			continue
 		}
-		fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", pp.gid, k)
+		fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %x\n", pp.gid, k)
 		printStack(Opts.LogBuf, pp.stack)
 	}
 	fmt.Fprintln(Opts.LogBuf)
