@@ -3,12 +3,20 @@ package deadlock
 import (
 	"log"
 	"math/rand"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+var _ = log.Println
+
+func restore() func() {
+	opts := Opts
+	return func() {
+		Opts = opts
+	}
+}
 
 func TestNoDeadlocks(t *testing.T) {
 	defer restore()()
@@ -58,39 +66,6 @@ func TestNoDeadlocks(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-}
-
-func TestLockOrder(t *testing.T) {
-	defer restore()()
-	Opts.DeadlockTimeout = 0
-	var deadlocks uint32
-	Opts.OnPotentialDeadlock = func() {
-		atomic.AddUint32(&deadlocks, 1)
-	}
-	var a RWMutex
-	var b Mutex
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		a.Lock()
-		b.Lock()
-		b.Unlock()
-		a.Unlock()
-	}()
-	wg.Wait()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		b.Lock()
-		a.RLock()
-		a.RUnlock()
-		b.Unlock()
-	}()
-	wg.Wait()
-	if atomic.LoadUint32(&deadlocks) != 1 {
-		t.Fatalf("expected 1 deadlock, detected %d", deadlocks)
-	}
 }
 
 func TestHardDeadlock(t *testing.T) {
@@ -155,13 +130,6 @@ func TestRWMutex(t *testing.T) {
 	<-ch
 }
 
-func restore() func() {
-	opts := Opts
-	return func() {
-		Opts = opts
-	}
-}
-
 func TestLockDuplicate(t *testing.T) {
 	defer restore()()
 	Opts.DeadlockTimeout = 0
@@ -189,41 +157,121 @@ func TestLockDuplicate(t *testing.T) {
 	}
 }
 
-const largeObjectSize = 10 * 1024 * 1024
-
-type largeStruct struct {
-	dummy [largeObjectSize]byte
-	mu    Mutex
-}
-
-func TestMemoryUsage(t *testing.T) {
-	var start runtime.MemStats
-	runtime.ReadMemStats(&start)
-
-	ch := make(chan struct{}, 1)
-	go func() {
-
-		x := 0
-		for i := 0; i < 10; i++ {
-			tmp1 := largeStruct{}
-			tmp2 := largeStruct{}
-			tmp1.mu.Lock()
-			tmp2.mu.Lock()
-			x++
-			tmp2.mu.Unlock()
-			tmp1.mu.Unlock()
+func TestDeadlockRecursiveFail(t *testing.T) {
+	defer restore()()
+	deadlockDetected := 0
+	Opts.DeadlockTimeout = time.Millisecond * 100
+	Opts.OnPotentialDeadlock = func() {
+		deadlockDetected = 1
+		panic(nil)
+	}
+	mu := Mutex{}
+	defer func() {
+		if r := recover(); r == nil {
+			// code paniced as expected.
 		}
-		_ = x
-		close(ch)
+		mu.Unlock()
 	}()
 
-	<-ch
+	mu.Lock()
+	mu.Lock()
+	if deadlockDetected == 0 {
+		t.Fail()
+	}
+}
 
-	runtime.GC()
+func TestLockOrderDetectionFail(t *testing.T) {
+	defer restore()()
+	deadlockDetected := 0
+	Opts.DeadlockTimeout = time.Millisecond * 100
+	Opts.OnPotentialDeadlock = func() {
+		deadlockDetected = 1
+		panic(nil)
+	}
+	c := make(chan struct{})
+	d := make(chan struct{})
+	mu1 := Mutex{}
+	mu2 := Mutex{}
 
-	var end runtime.MemStats
-	runtime.ReadMemStats(&end)
-	if start.Alloc+largeObjectSize/2 < end.Alloc {
-		t.Fatalf("allocated extra %d bytes", end.Alloc-start.Alloc)
+	mu1.Lock()
+	go func() {
+		defer func() {
+			if r := recover(); r == nil {
+				// code paniced as expected.
+			}
+			close(d)
+		}()
+		mu2.Lock()
+		close(c)
+		// this *should* fail, panicing.
+		mu1.Lock()
+	}()
+	<-c
+	<-d
+	if deadlockDetected == 0 {
+		t.Fail()
+	}
+	mu2.Unlock()
+	mu1.Unlock()
+}
+
+func TestLockOrderDetectionSuccess(t *testing.T) {
+	c := make(chan struct{})
+	d := make(chan struct{})
+	mu1 := Mutex{}
+	mu2 := Mutex{}
+	mu1.Lock()
+	mu2.Lock()
+	go func() {
+		mu2.Lock()
+		mu1.Lock()
+		close(d)
+	}()
+	time.Sleep(time.Millisecond * 100)
+	go func() {
+		mu1.Unlock()
+		mu2.Unlock()
+		close(c)
+	}()
+	<-c
+	<-d
+	mu1.Unlock()
+	mu2.Unlock()
+}
+
+func TestDeadlockRecursiveSuccess(t *testing.T) {
+	mu := Mutex{}
+	mu2 := Mutex{}
+	mu.Lock()
+	go func() {
+		mu2.Lock()
+		mu.Unlock()
+	}()
+	mu.Lock()
+	mu2.Unlock()
+	mu.Unlock()
+}
+
+func TestRWMutexDoubleRLockFail(t *testing.T) {
+	defer restore()()
+	var deadlocks uint32
+	Opts.OnPotentialDeadlock = func() {
+		atomic.AddUint32(&deadlocks, 1)
+	}
+	var a RWMutex
+	d := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r == nil {
+				// code paniced as expected.
+			}
+			close(d)
+		}()
+		a.RLock()
+		a.RLock()
+	}()
+	<-d
+	if atomic.LoadUint32(&deadlocks) != 1 {
+		t.Fatalf("expected 1 deadlocks, detected %d", deadlocks)
 	}
 }

@@ -77,7 +77,7 @@ func (m *Mutex) Lock() {
 		currID++
 	}
 	counterMu.Unlock()
-	lock(m.mu.Lock, m)
+	lock(m.mu.Lock, m, false)
 }
 
 // Unlock unlocks the mutex.
@@ -121,7 +121,7 @@ func (m *RWMutex) Lock() {
 	}
 	counterMu.Unlock()
 
-	lock(m.mu.Lock, m)
+	lock(m.mu.Lock, m, false)
 }
 
 // Unlock unlocks the mutex for writing.  It is a run-time error if rw is
@@ -149,7 +149,7 @@ func (m *RWMutex) RLock() {
 	}
 	counterMu.Unlock()
 
-	lock(m.mu.RLock, m)
+	lock(m.mu.RLock, m, true)
 }
 
 // RUnlock undoes a single RLock call;
@@ -169,24 +169,34 @@ func (m *RWMutex) RLocker() sync.Locker {
 	return (*rlocker)(m)
 }
 
-func preLock(skip int, p identifiable) {
-	lo.preLock(skip, p)
+func preLock(skip int, p identifiable, gid int64, checkRecursiveLocking bool) {
+	lo.preLock(skip, p, gid, checkRecursiveLocking)
 }
 
-func postLock(skip int, p identifiable) {
-	lo.postLock(skip, p)
+func postLock(skip int, p identifiable, gid int64) {
+	lo.postLock(skip, p, gid)
 }
 
 func postUnlock(p identifiable) {
 	lo.postUnlock(p)
 }
 
-func lock(lockFn func(), ptr identifiable) {
+func checkRecursiveLocking(skip int, p identifiable, gid int64) {
+	lo.checkRecursiveLocking(skip, p, gid)
+}
+
+func checkLockOrdering(skip int, p identifiable, gid int64) {
+	lo.checkLockOrdering(skip, p, gid)
+}
+
+func lock(lockFn func(), ptr identifiable, preLockCheckRecursiveLocking bool) {
 	if Opts.Disable {
 		lockFn()
 		return
 	}
-	preLock(4, ptr)
+	// grab the current goroutine identifier
+	gid := goid.Get()
+	preLock(4, ptr, gid, preLockCheckRecursiveLocking)
 	if Opts.DeadlockTimeout <= 0 {
 		lockFn()
 	} else {
@@ -200,6 +210,10 @@ func lock(lockFn func(), ptr identifiable) {
 			defer t.Stop()
 			select {
 			case <-t.C:
+				if !preLockCheckRecursiveLocking {
+					checkRecursiveLocking(4, ptr, gid)
+				}
+				checkLockOrdering(4, ptr, gid)
 				lo.mu.Lock()
 
 				prev, ok := lo.cur[ptr.id()]
@@ -213,7 +227,7 @@ func lock(lockFn func(), ptr identifiable) {
 				fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", prev.gid, ptr)
 				printStack(Opts.LogBuf, prev.stack)
 				fmt.Fprintln(Opts.LogBuf, "Have been trying to lock it again for more than", Opts.DeadlockTimeout)
-				fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", goid.Get(), ptr)
+				fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", gid, ptr)
 				printStack(Opts.LogBuf, callers(2))
 				stacks := stacks()
 				grs := bytes.Split(stacks, []byte("\n\n"))
@@ -237,15 +251,15 @@ func lock(lockFn func(), ptr identifiable) {
 				lo.mu.Unlock()
 				Opts.OnPotentialDeadlock()
 				<-ch
-				postLock(4, ptr)
+				postLock(4, ptr, gid)
 				return
 			case <-ch:
-				postLock(4, ptr)
+				postLock(4, ptr, gid)
 				return
 			}
 		}
 	}
-	postLock(4, ptr)
+	postLock(4, ptr, gid)
 }
 
 type lockOrder struct {
@@ -273,77 +287,145 @@ var lo = newLockOrder()
 
 func newLockOrder() *lockOrder {
 	return &lockOrder{
-		cur:   map[lockID]stackGID{},
+		cur:   map[lockID]stackGID{}, // maps each lock identifier to the stack that was acquired after the lock was taken.
 		order: map[beforeAfter]ss{},
 	}
 }
 
-func (l *lockOrder) postLock(skip int, p identifiable) {
+func (l *lockOrder) postLock(skip int, p identifiable, gid int64) {
 	stack := callers(skip)
-	gid := goid.Get()
 	l.mu.Lock()
 	l.cur[p.id()] = stackGID{stack, gid}
 	l.mu.Unlock()
 }
 
-func (l *lockOrder) preLock(skip int, p identifiable) {
+func (l *lockOrder) printRecursiveLocking(currentGoRoutineID int64, otherLockID lockID, currentStack []uintptr, otherStack []uintptr, p identifiable) {
+	Opts.mu.Lock()
+	fmt.Fprintln(Opts.LogBuf, header, "Recursive locking:")
+	fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %x\n", currentGoRoutineID, otherLockID)
+	printStack(Opts.LogBuf, currentStack)
+	fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed (same goroutine)")
+	printStack(Opts.LogBuf, otherStack)
+	l.other(p)
+	if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
+		buf.Flush()
+	}
+	Opts.mu.Unlock()
+	Opts.OnPotentialDeadlock()
+}
+
+func (l *lockOrder) printLockOrdering(currentGoRoutineID int64, otherLockID lockID, currentStack []uintptr, otherStack []uintptr, p identifiable, s ss) {
+	Opts.mu.Lock()
+	fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
+	fmt.Fprintln(Opts.LogBuf, "happened before")
+	printStack(Opts.LogBuf, s.before)
+	fmt.Fprintln(Opts.LogBuf, "happened after")
+	printStack(Opts.LogBuf, s.after)
+	fmt.Fprintln(Opts.LogBuf, "in another goroutine: happened before")
+	printStack(Opts.LogBuf, otherStack)
+	fmt.Fprintln(Opts.LogBuf, "happened after")
+	printStack(Opts.LogBuf, currentStack)
+	l.other(p)
+	fmt.Fprintln(Opts.LogBuf)
+	if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
+		buf.Flush()
+	}
+	Opts.mu.Unlock()
+	Opts.OnPotentialDeadlock()
+}
+
+func (l *lockOrder) checkRecursiveLocking(skip int, p identifiable, gid int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lockID := p.id()
+	for otherLockID, otherLockStack := range l.cur {
+		if otherLockStack.gid != gid { // We want locks taken in the same goroutine only.
+			continue
+		}
+		if otherLockID == lockID {
+			// we want to wait up to Opt.DeadlockTimeout before giving up.
+			stack := callers(skip)
+			l.printRecursiveLocking(gid, otherLockID, stack, otherLockStack.stack, p)
+		}
+	}
+}
+func (l *lockOrder) checkLockOrdering(skip int, p identifiable, gid int64) {
 	if Opts.DisableLockOrderDetection {
 		return
 	}
-	stack := callers(skip)
-	gid := goid.Get()
+
+	lockID := p.id()
 	l.mu.Lock()
-	for b, bs := range l.cur {
-		if b == p.id() {
-			if bs.gid == gid {
-				Opts.mu.Lock()
-				fmt.Fprintln(Opts.LogBuf, header, "Recursive locking:")
-				fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %x\n", gid, b)
-				printStack(Opts.LogBuf, stack)
-				fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed (same goroutine)")
-				printStack(Opts.LogBuf, bs.stack)
-				l.other(p)
-				if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
-					buf.Flush()
-				}
-				Opts.mu.Unlock()
-				Opts.OnPotentialDeadlock()
-			}
+	defer l.mu.Unlock()
+	for otherLockID, otherLockStack := range l.cur {
+		if otherLockStack.gid != gid { // We want locks taken in the same goroutine only.
 			continue
 		}
-		if bs.gid != gid { // We want locks taken in the same goroutine only.
+		if otherLockID == lockID {
+			// we want to wait up to Opt.DeadlockTimeout before giving up.
+			// we will do this testing during the lock() function.
 			continue
 		}
-		if s, ok := l.order[beforeAfter{p.id(), b}]; ok {
-			Opts.mu.Lock()
-			fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
-			fmt.Fprintln(Opts.LogBuf, "happened before")
-			printStack(Opts.LogBuf, s.before)
-			fmt.Fprintln(Opts.LogBuf, "happened after")
-			printStack(Opts.LogBuf, s.after)
-			fmt.Fprintln(Opts.LogBuf, "in another goroutine: happened before")
-			printStack(Opts.LogBuf, bs.stack)
-			fmt.Fprintln(Opts.LogBuf, "happened after")
-			printStack(Opts.LogBuf, stack)
-			l.other(p)
-			fmt.Fprintln(Opts.LogBuf)
-			if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
-				buf.Flush()
-			}
-			Opts.mu.Unlock()
-			Opts.OnPotentialDeadlock()
+
+		if s, ok := l.order[beforeAfter{lockID, otherLockID}]; ok {
+			stack := callers(skip)
+			l.printLockOrdering(gid, otherLockID, stack, otherLockStack.stack, p, s)
 		}
-		l.order[beforeAfter{b, p.id()}] = ss{bs.stack, stack}
+	}
+}
+
+func (l *lockOrder) storeLockOrder(skip int, p identifiable, gid int64) {
+	if Opts.DisableLockOrderDetection {
+		return
+	}
+
+	stack := callers(skip)
+	lockID := p.id()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for otherLockID, otherLockStack := range l.cur {
+		if otherLockStack.gid != gid { // We want locks taken in the same goroutine only.
+			continue
+		}
+		if otherLockID == lockID {
+			// we want to wait up to Opt.DeadlockTimeout before giving up.
+			// we will do this testing during the lock() function.
+			continue
+		}
+
+		l.order[beforeAfter{otherLockID, lockID}] = ss{otherLockStack.stack, stack}
 		if len(l.order) == Opts.MaxMapSize { // Reset the map to keep memory footprint bounded.
 			l.order = map[beforeAfter]ss{}
 		}
 	}
-	l.mu.Unlock()
+}
+
+func (l *lockOrder) preLock(skip int, p identifiable, gid int64, checkRecursiveLocking bool) {
+	if Opts.DeadlockTimeout <= 0 || checkRecursiveLocking {
+		l.checkRecursiveLocking(skip, p, gid)
+		l.checkLockOrdering(skip, p, gid)
+	}
+
+	l.storeLockOrder(skip, p, gid)
+}
+
+func (l *lockOrder) pruneLockOrder(p identifiable) {
+	prunedBa := make([]beforeAfter, 0)
+	for ba := range l.order {
+		if ba.after == p.id() {
+			// remove this entry.
+			prunedBa = append(prunedBa, ba)
+		}
+	}
+	for _, ba := range prunedBa {
+		delete(l.order, ba)
+	}
 }
 
 func (l *lockOrder) postUnlock(p identifiable) {
 	l.mu.Lock()
 	delete(l.cur, p.id())
+	l.pruneLockOrder(p)
 	l.mu.Unlock()
 }
 
