@@ -71,13 +71,20 @@ func (m *Mutex) id() lockID {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *Mutex) Lock() {
+	// shortcut for disabled deadlock detection to prevent extra copying of `m.mu.Lock` to the heap
+	if Opts.Disable {
+		m.mu.Lock()
+		return
+	}
+
 	counterMu.Lock()
 	if m.muId == 0 {
 		m.muId = currID
 		currID++
 	}
 	counterMu.Unlock()
-	lock(m.mu.Lock, m, false)
+
+	lockEnabled(m.mu.Lock, m, false)
 }
 
 // Unlock unlocks the mutex.
@@ -114,6 +121,11 @@ func (m *RWMutex) id() lockID {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) Lock() {
+	if Opts.Disable {
+		m.mu.Lock()
+		return
+	}
+
 	counterMu.Lock()
 	if m.muId == 0 {
 		m.muId = currID
@@ -121,7 +133,7 @@ func (m *RWMutex) Lock() {
 	}
 	counterMu.Unlock()
 
-	lock(m.mu.Lock, m, false)
+	lockEnabled(m.mu.Lock, m, false)
 }
 
 // Unlock unlocks the mutex for writing.  It is a run-time error if rw is
@@ -142,6 +154,11 @@ func (m *RWMutex) Unlock() {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) RLock() {
+	if Opts.Disable {
+		m.mu.RLock()
+		return
+	}
+
 	counterMu.Lock()
 	if m.muId == 0 {
 		m.muId = currID
@@ -149,7 +166,7 @@ func (m *RWMutex) RLock() {
 	}
 	counterMu.Unlock()
 
-	lock(m.mu.RLock, m, true)
+	lockEnabled(m.mu.RLock, m, true)
 }
 
 // RUnlock undoes a single RLock call;
@@ -189,11 +206,7 @@ func checkLockOrdering(skip int, p identifiable, gid int64) {
 	lo.checkLockOrdering(skip, p, gid)
 }
 
-func lock(lockFn func(), ptr identifiable, preLockCheckRecursiveLocking bool) {
-	if Opts.Disable {
-		lockFn()
-		return
-	}
+func lockEnabled(lockFn func(), ptr identifiable, preLockCheckRecursiveLocking bool) {
 	// grab the current goroutine identifier
 	gid := goid.Get()
 	preLock(4, ptr, gid, preLockCheckRecursiveLocking)
