@@ -1,4 +1,4 @@
-module github.com/algorand/go-deadlock
+module github.com/xboshy/go-deadlock
 
 go 1.20
 
